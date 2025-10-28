@@ -26,6 +26,7 @@ class DetectionProcessor(threading.Thread):
         self.qpos_persistence_tracker = defaultdict(list)
         self.latest_frame = None
         self.lock = threading.Lock()
+        self.cached_boxes = {}  # Cache for bounding boxes
 
     def stop(self):
         self.is_running = False
@@ -55,6 +56,9 @@ class DetectionProcessor(threading.Thread):
 
         is_file = any(self.rtsp_url.lower().endswith(ext) for ext in ['.mp4', '.avi', '.mov'])
         
+        last_inference_time = 0
+        inference_interval = 0.2  # 5 FPS inference for performance
+        
         while self.is_running:
             ret, frame = cap.read()
             if not ret:
@@ -71,36 +75,55 @@ class DetectionProcessor(threading.Thread):
 
             current_time = time.time()
             
-            # ALWAYS run detection and annotate for live feed
-            annotated_frame = frame.copy()
-            
-            for task in self.tasks:
-                app_name = task['app_name']
+            # Throttled detection - only run inference periodically
+            if current_time - last_inference_time >= inference_interval:
+                last_inference_time = current_time
                 
-                # Run model inference on every frame
-                results = task['model'](
-                    frame,
-                    conf=task['confidence'],
-                    classes=task.get('target_class_id'),
-                    verbose=False
-                )
-                
-                # Draw bounding boxes for live feed
-                if results and len(results[0].boxes) > 0:
-                    annotated_frame = results[0].plot()
+                for task in self.tasks:
+                    app_name = task['app_name']
                     
-                    # Only trigger detection callback if cooldown passed
-                    if current_time - self.last_detection_times[app_name] >= self.cooldown:
-                        self._trigger_detection_callback(
-                            app_name, results, annotated_frame, 
-                            current_time, task, cap
-                        )
+                    # Run model inference
+                    results = task['model'](
+                        frame,
+                        conf=task['confidence'],
+                        classes=task.get('target_class_id'),
+                        verbose=False
+                    )
+                    
+                    # Cache boxes and trigger callbacks
+                    if results and len(results[0].boxes) > 0:
+                        self.cached_boxes[app_name] = results[0].boxes
+                        
+                        if current_time - self.last_detection_times[app_name] >= self.cooldown:
+                            annotated_frame = results[0].plot()
+                            self._trigger_detection_callback(
+                                app_name, results, annotated_frame, 
+                                current_time, task, cap
+                            )
+                    else:
+                        # Clear cached boxes if no detection
+                        self.cached_boxes[app_name] = None
             
-            # Store annotated frame for live streaming
+            # Draw cached boxes on current frame for live feed
+            display_frame = self._draw_cached_boxes(frame)
+            
+            # Store for streaming
             with self.lock:
-                self.latest_frame = annotated_frame.copy()
+                self.latest_frame = display_frame.copy()
         
         cap.release()
+
+    def _draw_cached_boxes(self, frame):
+        """Draw cached bounding boxes on frame"""
+        annotated = frame.copy()
+        
+        for app_name, boxes in self.cached_boxes.items():
+            if boxes is not None and len(boxes) > 0:
+                for box in boxes.xyxy.cpu():
+                    x1, y1, x2, y2 = map(int, box)
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        
+        return annotated
 
     def _trigger_detection_callback(self, app_name, results, annotated_frame, 
                                     current_time, task, cap):
